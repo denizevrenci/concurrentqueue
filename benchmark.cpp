@@ -1,3 +1,6 @@
+// Compile with:
+// g++-9 --std=c++17 -O3 -march=native -I benchmarks -I .. -I ../MPMCQueue/include/rigtorp -I ../folly/ -I ~/work/quoine/Hikari/build/gcc-Debug/thirdparty/folly/ -DNDEBUG benchmark.cpp ../folly/folly/detail/Futex.cpp ../folly/folly/synchronization/ParkingLot.cpp -o bench
+
 #include <queue>
 #include <algorithm>
 #include <functional>
@@ -25,28 +28,11 @@
 #include <boost/fiber/bounded_channel.hpp>
 #endif
 
-#include <boost/thread/sync_bounded_queue.hpp>
 #include <boost/lockfree/queue.hpp>
-#include <tbb/concurrent_queue.h>
 #include "concurrentqueue/blockingconcurrentqueue.h" // moodycamel
-#include <queues/include/mpmc-bounded-queue.hpp> // https://github.com/mstump/queues
-                                                 // https://int08h.com/post/ode-to-a-vyukov-queue/
-
-// required by MPMCQueue.h; missing in earlier stdlib
-namespace std
-{
-    inline void *align( std::size_t alignment, std::size_t size,
-                    void *&ptr, std::size_t &space ) {
-        std::uintptr_t pn = reinterpret_cast< std::uintptr_t >( ptr );
-        std::uintptr_t aligned = ( pn + alignment - 1 ) & - alignment;
-        std::size_t padding = aligned - pn;
-        if ( space < size + padding ) return nullptr;
-        space -= padding;
-        return ptr = reinterpret_cast< void * >( aligned );
-    }
-}
 #include "MPMCQueue.h" //https://github.com/rigtorp/MPMCQueue.git
-
+#include <folly/MPMCQueue.h>
+#include <folly/Function.h>
 
 #pragma GCC diagnostic pop
 
@@ -84,7 +70,6 @@ private:
 /// \brief Can be used as alternative to std::mutex.
 /// It is typically faster than std::mutex, yet does not aggressively max-out the CPUs.
 /// NB: may cause thread starvation in some scenarios.
-template<uint64_t SleepMicrosec = 50>
 class atomic_lock
 {
     std::atomic_flag m_flag = ATOMIC_FLAG_INIT;
@@ -108,10 +93,8 @@ public:
 
     void lock() noexcept
     {
-        while(m_flag.test_and_set(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(SleepMicrosec));
-        }
+        while (m_flag.test_and_set(std::memory_order_acquire))
+          std::this_thread::yield();
     }
 
     void unlock() noexcept
@@ -136,7 +119,8 @@ public:
     {}
 
     /////////////////////////////////////////////////////////////////////////
-    void push(value_type val)
+    template <typename... args_t>
+    void push(args_t&&... args)
     {
         // NB: guards are to prevent thread starvation in
         // MPSC and SPMC scenarios when used with atomic_lock
@@ -146,7 +130,7 @@ public:
         m_can_push.wait(
             lock, [this]{ return m_queue.size() < m_capacity; });
 
-        m_queue.push(std::move(val));
+        m_queue.emplace(std::forward<args_t>(args)...);
 
         lock.unlock();
         m_can_pop.notify_one();
@@ -213,21 +197,14 @@ static void min_sleep()
 // Non-blocking calls are wrapped into a busy-wait loops
 // (e.g. boost::lockfree below)
 
-template<typename T, typename Queue>
-auto push(Queue& q, T value) -> decltype((void)q.push(T{}))
+template <typename T, typename lock_t, typename... args_t>
+auto push(mt::naive_synchronized_queue<T, lock_t>& q, args_t&&... args) -> decltype((void)q.push(T{}))
 {
-    q.push(std::move(value));
+    q.push(std::forward<args_t>(args)...);
 }
 
-template<typename T>
-void push(boost::lockfree::queue<T>& q, T value)
-{
-    // bounded_push blocks if the queue is at capacity
-    while(!q.bounded_push(std::move(value))) { mt::min_sleep(); }
-}
-
-template<typename T>
-void push(moodycamel::BlockingConcurrentQueue<T>& q, T value)
+template<typename T, typename... args_t>
+void push(moodycamel::BlockingConcurrentQueue<T>& q, args_t&&... args)
 {
 #if 1
     while(q.size_approx() > g_capacity) {
@@ -241,33 +218,29 @@ void push(moodycamel::BlockingConcurrentQueue<T>& q, T value)
     // Even if we don't cap the capacity, this does not
     // affect the results of the benchmarks.
 #endif
-    q.enqueue(std::move(value));
+    q.enqueue(T{std::forward<args_t>(args)...});
 }
 
-template<typename T>
-void push(moodycamel::ConcurrentQueue<T>& q, T value)
+template<typename T, typename... args_t>
+void push(moodycamel::ConcurrentQueue<T>& q, args_t&&... args)
 {
-    while(q.size_approx() > g_capacity) {
+    while (q.size_approx() > g_capacity) {
         mt::min_sleep(); // see comments in the overload above
     }
-    q.enqueue(std::move(value));
+    q.enqueue(std::forward<args_t>(args)...);
 }
 
-template<typename T>
-void push(tbb::concurrent_queue<T>& q, T value)
+template <typename T, typename... args_t>
+void push(rigtorp::MPMCQueue<T>& q, args_t&&... args)
 {
-    while(q.unsafe_size() > g_capacity) {
-        mt::min_sleep(); // see comments in the overload above
-    }
-    q.push(std::move(value));
+    q.emplace(std::forward<args_t>(args)...);
 }
 
-template<typename T>
-void push(mpmc_bounded_queue_t<T>& q, T value)
+template<typename T, typename... args_t>
+void push(folly::MPMCQueue<T>& q, args_t&&... args)
 {
-    while(!q.enqueue(value)) {
-        mt::min_sleep();
-    }
+  while (!q.write(std::forward<args_t>(args)...))
+    mt::min_sleep();
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -287,24 +260,10 @@ auto pop(Queue& q) -> decltype((void)q.pop(std::declval<T&>()), T{})
 }
 
 template<typename T>
-T pop(boost::sync_bounded_queue<T>& q)
-{
-    return q.pull_front();
-}
-
-#ifdef WITH_BOOST_FIBER
-template<typename T>
-T pop(boost::fibers::bounded_channel<T>& q)
-{
-    return q.value_pop();
-}
-#endif
-
-template<typename T>
 T pop(boost::lockfree::queue<T>& q)
 {
     T elem{};
-    while(!q.pop(elem)) {
+    while (!q.pop(elem)) {
         mt::min_sleep();
     }
     return elem;
@@ -314,7 +273,7 @@ template<typename T>
 T pop(moodycamel::ConcurrentQueue<T>& q)
 {
     T item{};
-    while(!q.try_dequeue(item)) {
+    while (!q.try_dequeue(item)) {
         mt::min_sleep();
     }
     return item;
@@ -328,23 +287,13 @@ T pop(moodycamel::BlockingConcurrentQueue<T>& q)
     return item;
 }
 
-template<typename T>
-T pop(tbb::concurrent_queue<T>& q)
+template <typename T>
+T pop(folly::MPMCQueue<T>& q)
 {
-    T item{};
-    while(!q.try_pop(item)) {
-        mt::min_sleep();
-    }
-    return item;
-}
-template<typename T>
-T pop(mpmc_bounded_queue_t<T>& q)
-{
-    T item{};
-    while(!q.dequeue(item)) {
-        mt::min_sleep();
-    }
-    return item;
+  T item{};
+  while (!q.read(item))
+    mt::min_sleep();
+  return item;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -367,28 +316,39 @@ double get_throughput(
     std::vector<std::future<long>> pushers{ num_pushers };
     std::vector<std::future<long>> poppers{ num_poppers };
 
+    std::string muh_string = "asdaasdasdasdasdsdfgfdgljgkjsdfg;ksdglksdfgjd;lkfgjsd;fkghjhljhasdfjkhksdfhkasdhfkkasdhfkasdkkaskdfjysdufaksdfkasdfbkjs";
+    std::vector<std::vector<std::string>> strings(num_pushers);
+    for (auto& v : strings) {
+      v.reserve(num_elems / num_pushers);
+      for (size_t ii = 0; ii != num_elems / num_pushers; ++ii)
+        v.push_back(muh_string);
+    }
+
     mt::timer timer;
 
     // launch pushing tasks
-    for(auto& p : pushers) {
-        p = std::async(std::launch::async, [&]
+    size_t ii = 0;
+    for (auto& p : pushers) {
+        p = std::async(std::launch::async, [&, ii]
             {
                 long total = 0;
-                for(size_t j = 0; j < num_elems/num_pushers; j++) {
-                    push<T>(queue, 1);
-                    total++;
+                for (size_t j = 0; j < num_elems/num_pushers; ++j) {
+                    push<T>(queue, [asd = std::move(strings[ii][j])] () noexcept { std::cout << asd << std::endl; });
+                    ++total;
                 }
                 return total;
             });
+        ++ii;
     }
 
     // launch popping tasks
-    for(auto& p : poppers) {
+    for (auto& p : poppers) {
         p = std::async(std::launch::async, [&]
             {
                 long total = 0;
                 for(size_t j = 0; j < num_elems/num_poppers; j++) {
-                    total += pop<T>(queue);
+                    pop<T>(queue);
+                    ++total;
                 }
                 return total;
             });
@@ -446,7 +406,7 @@ void test_scenario(
     };
 
     // aggregate over a few runs
-    const double throughput = get_harmonic_mean(get_throughput_once, 10);
+    const double throughput = get_harmonic_mean(get_throughput_once, 25);
 
     const auto s = std::to_string(num_pushers)
            + "/" + std::to_string(num_poppers);
@@ -473,11 +433,11 @@ void test_scenarios(Queue& queue)
     size_t half_cores = num_cores == 1 ? 1 : num_cores/2;
     size_t num_elems = g_num_elements;
 
-    test_scenario<T>(queue, 1UL,         1UL,         num_elems/4); // SPSC
-    test_scenario<T>(queue, 1UL,         num_cores,   num_elems/4); // SPMC
-    test_scenario<T>(queue, num_cores,   1UL,         num_elems/4); // MPSC
-    test_scenario<T>(queue, half_cores,  half_cores,  num_elems);   // MPMC
-    test_scenario<T>(queue, num_cores*4, num_cores*4, num_elems);   // MPSC(congested)
+    test_scenario<T>(queue, 1UL,         1UL,         num_elems/4);
+    test_scenario<T>(queue, 1UL,         num_cores - 1UL,   num_elems/16*(num_cores - 1));
+    test_scenario<T>(queue, 2UL,         num_cores - 2UL,   num_elems/16*(num_cores - 2));
+    test_scenario<T>(queue, 3UL,         num_cores - 3UL,   num_elems/32*3*(num_cores - 3));
+    test_scenario<T>(queue, 4UL,         2 * num_cores,   num_elems/4*num_cores);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -488,25 +448,6 @@ void test(const std::string& label, Queue*)
 {
     std::cerr << "\n" << label << "\n";
     Queue queue{ g_capacity };
-    test_scenarios<T>(queue);
-}
-
-// tbb::concurrent_bounded_queue needs to have set_capacity called explicitly.
-template<typename T>
-void test(const std::string& label, tbb::concurrent_bounded_queue<T>*)
-{
-    std::cerr << "\n" << label << "\n";
-    tbb::concurrent_bounded_queue<T> queue{};
-    queue.set_capacity(g_capacity);
-    test_scenarios<T>(queue);
-}
-
-// tbb::concurrent_queue does not have a contsructor accepting capacity
-template<typename T>
-void test(const std::string& label, tbb::concurrent_queue<T>*)
-{
-    std::cerr << "\n" << label << "\n";
-    tbb::concurrent_queue<T> queue{};
     test_scenarios<T>(queue);
 }
 
@@ -524,29 +465,18 @@ int main()
               << "\ncolumns: producers/consumers | throughput(M/s) | bar"
               << std::endl;
 
-    using T = long;
+    using type = folly::Function<void()>;
 
-#define TEST(...) test<T>(#__VA_ARGS__, reinterpret_cast<__VA_ARGS__*>(NULL));
+#define TEST(...) test<type>(#__VA_ARGS__, reinterpret_cast<__VA_ARGS__*>(NULL));
 
-    TEST( mt::naive_synchronized_queue<T, std::mutex> );
-    TEST( mt::naive_synchronized_queue<T, mt::atomic_lock<> > );
+    TEST( mt::naive_synchronized_queue<type, std::mutex> );
+    TEST( mt::naive_synchronized_queue<type, mt::atomic_lock> );
 
-    TEST( mpmc_bounded_queue_t<T> );
+    TEST( moodycamel::ConcurrentQueue<type> );
+    TEST( moodycamel::BlockingConcurrentQueue<type> );
 
-    TEST( tbb::concurrent_queue<T> );
-    TEST( tbb::concurrent_bounded_queue<T> );
-
-    TEST( moodycamel::ConcurrentQueue<T> );
-    TEST( moodycamel::BlockingConcurrentQueue<T> );
-
-    TEST( rigtorp::MPMCQueue<T> );
-
-    TEST( boost::sync_bounded_queue<T> );
-    TEST( boost::lockfree::queue<T> );
-
-#ifdef WITH_BOOST_FIBER
-    TEST( boost::fibers::bounded_channel<T> );
-#endif
+    TEST( rigtorp::MPMCQueue<type> );
+    TEST( folly::MPMCQueue<type> );
 
     return 0;
 }
