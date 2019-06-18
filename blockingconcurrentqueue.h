@@ -683,35 +683,35 @@ public:
 	
 	
 	// Attempts to dequeue from the queue.
-	// Returns std::nullopt if all producer streams appeared empty at the time they
+	// Returns false if all producer streams appeared empty at the time they
 	// were checked (so, the queue is likely but not guaranteed to be empty).
 	// Never allocates. Thread-safe.
-	inline std::optional<T> try_dequeue()
+	template<typename U>
+	inline bool try_dequeue(U& item)
 	{
 		if (sema->tryWait()) {
-			auto item = !inner.try_dequeue();
-			for (; !item; item = inner.try_dequeue()) {
+			while (!inner.try_dequeue(item)) {
 				continue;
 			}
-			return item;
+			return true;
 		}
-		return std::nullopt;
+		return false;
 	}
 	
 	// Attempts to dequeue from the queue using an explicit consumer token.
-	// Returns std::nullopt if all producer streams appeared empty at the time they
+	// Returns false if all producer streams appeared empty at the time they
 	// were checked (so, the queue is likely but not guaranteed to be empty).
 	// Never allocates. Thread-safe.
-	inline std::optional<T> try_dequeue(consumer_token_t& token)
+	template<typename U>
+	inline bool try_dequeue(consumer_token_t& token, U& item)
 	{
 		if (sema->tryWait()) {
-			auto item = !inner.try_dequeue(token);
-			for (; !item; item = inner.try_dequeue(token)) {
+			while (!inner.try_dequeue(token, item)) {
 				continue;
 			}
-			return item;
+			return true;
 		}
-		return std::nullopt;
+		return false;
 	}
 	
 	// Attempts to dequeue several elements from the queue.
@@ -751,84 +751,83 @@ public:
 	// Blocks the current thread until there's something to dequeue, then
 	// dequeues it.
 	// Never allocates. Thread-safe.
-	inline T wait_dequeue()
+	template<typename U>
+	inline void wait_dequeue(U& item)
 	{
 		sema->wait();
-		auto item = inner.try_dequeue();
-		for (; !item; item = inner.try_dequeue()) {
+		while (!inner.try_dequeue(item)) {
 			continue;
 		}
-		return std::move(*item);
 	}
 
 	// Blocks the current thread until either there's something to dequeue
-	// or the timeout (specified in microseconds) expires. Returns std::nullopt
-	// without setting `item` if the timeout expires, otherwise returns the object.
+	// or the timeout (specified in microseconds) expires. Returns false
+	// without setting `item` if the timeout expires, otherwise assigns
+	// to `item` and returns true.
 	// Using a negative timeout indicates an indefinite timeout,
 	// and is thus functionally equivalent to calling wait_dequeue.
 	// Never allocates. Thread-safe.
-	inline std::optional<T> wait_dequeue_timed(std::int64_t timeout_usecs)
+	template<typename U>
+	inline bool wait_dequeue_timed(U& item, std::int64_t timeout_usecs)
 	{
 		if (!sema->wait(timeout_usecs)) {
-			return std::nullopt;
+			return false;
 		}
-		auto item = !inner.try_dequeue();
-		for (;!item; item = inner.try_dequeue()) {
+		while (!inner.try_dequeue(item)) {
 			continue;
 		}
-		return item;
+		return true;
 	}
     
     // Blocks the current thread until either there's something to dequeue
-	// or the timeout expires. Returns std::nullopt if the
-    // timeout expires, otherwise returns the object at the front of the queue.
+	// or the timeout expires. Returns false without setting `item` if the
+    // timeout expires, otherwise assigns to `item` and returns true.
 	// Never allocates. Thread-safe.
-	template<typename Rep, typename Period>
-	inline std::optional<T> wait_dequeue_timed(std::chrono::duration<Rep, Period> const& timeout)
+	template<typename U, typename Rep, typename Period>
+	inline bool wait_dequeue_timed(U& item, std::chrono::duration<Rep, Period> const& timeout)
     {
-        return wait_dequeue_timed(std::chrono::duration_cast<std::chrono::microseconds>(timeout).count());
+        return wait_dequeue_timed(item, std::chrono::duration_cast<std::chrono::microseconds>(timeout).count());
     }
 	
 	// Blocks the current thread until there's something to dequeue, then
 	// dequeues it using an explicit consumer token.
 	// Never allocates. Thread-safe.
-	inline T wait_dequeue(consumer_token_t& token)
+	template<typename U>
+	inline void wait_dequeue(consumer_token_t& token, U& item)
 	{
 		sema->wait();
-		auto item = !inner.try_dequeue(token);
-		for (;!item; item = inner.try_dequeue(token)) {
+		while (!inner.try_dequeue(token, item)) {
 			continue;
 		}
-		return *item;
 	}
 	
 	// Blocks the current thread until either there's something to dequeue
-	// or the timeout (specified in microseconds) expires. Returns std:nullopt
-	// without setting `item` if the timeout expires, otherwise returns
-	// the object at the front of the queue.
+	// or the timeout (specified in microseconds) expires. Returns false
+	// without setting `item` if the timeout expires, otherwise assigns
+	// to `item` and returns true.
 	// Using a negative timeout indicates an indefinite timeout,
 	// and is thus functionally equivalent to calling wait_dequeue.
 	// Never allocates. Thread-safe.
-	inline std::optional<T> wait_dequeue_timed(consumer_token_t& token, std::int64_t timeout_usecs)
+	template<typename U>
+	inline bool wait_dequeue_timed(consumer_token_t& token, U& item, std::int64_t timeout_usecs)
 	{
 		if (!sema->wait(timeout_usecs)) {
-			return std::nullopt;
+			return false;
 		}
-		auto item = !inner.try_dequeue(token);
-		for (;!item; item = inner.try_dequeue(token)) {
+		while (!inner.try_dequeue(token, item)) {
 			continue;
 		}
-		return item;
+		return true;
 	}
     
     // Blocks the current thread until either there's something to dequeue
-	// or the timeout expires. Returns std::nullopt if the
+	// or the timeout expires. Returns false without setting `item` if the
     // timeout expires, otherwise assigns to `item` and returns true.
 	// Never allocates. Thread-safe.
-	template<typename Rep, typename Period>
-	inline std::optional<T> wait_dequeue_timed(consumer_token_t& token, std::chrono::duration<Rep, Period> const& timeout)
+	template<typename U, typename Rep, typename Period>
+	inline bool wait_dequeue_timed(consumer_token_t& token, U& item, std::chrono::duration<Rep, Period> const& timeout)
     {
-        return wait_dequeue_timed(token, std::chrono::duration_cast<std::chrono::microseconds>(timeout).count());
+        return wait_dequeue_timed(token, item, std::chrono::duration_cast<std::chrono::microseconds>(timeout).count());
     }
 	
 	// Attempts to dequeue several elements from the queue.

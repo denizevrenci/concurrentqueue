@@ -69,7 +69,6 @@
 #include <climits>		// for CHAR_BIT
 #include <array>
 #include <thread>		// partly for __WINPTHREADS_VERSION if on MinGW-w64 w/ POSIX threading
-#include <optional>
 
 // Platform-specific definitions of a numeric thread ID type and an invalid value
 namespace moodycamel { namespace details {
@@ -1057,10 +1056,11 @@ public:
 	
 	
 	// Attempts to dequeue from the queue.
-	// Returns std::nullopt if all producer streams appeared empty at the time they
+	// Returns false if all producer streams appeared empty at the time they
 	// were checked (so, the queue is likely but not guaranteed to be empty).
 	// Never allocates. Thread-safe.
-	std::optional<T> try_dequeue()
+	template<typename U>
+	bool try_dequeue(U& item)
 	{
 		// Instead of simply trying each producer in turn (which could cause needless contention on the first
 		// producer), we score them heuristically.
@@ -1081,23 +1081,20 @@ public:
 		// If there was at least one non-empty queue but it appears empty at the time
 		// we try to dequeue from it, we need to make sure every queue's been tried
 		if (nonEmptyCount > 0) {
-			auto item = best->dequeue();
-			if ((details::likely)(item.has_value())) {
-				return item;
+			if ((details::likely)(best->dequeue(item))) {
+				return true;
 			}
 			for (auto ptr = producerListTail.load(std::memory_order_acquire); ptr != nullptr; ptr = ptr->next_prod()) {
-				if (ptr != best) {
-					if (auto item = ptr->dequeue()) {
-						return item;
-					}
+				if (ptr != best && ptr->dequeue(item)) {
+					return true;
 				}
 			}
 		}
-		return std::nullopt;
+		return false;
 	}
 	
 	// Attempts to dequeue from the queue.
-	// Returns std::nullopt if all producer streams appeared empty at the time they
+	// Returns false if all producer streams appeared empty at the time they
 	// were checked (so, the queue is likely but not guaranteed to be empty).
 	// This differs from the try_dequeue(item) method in that this one does
 	// not attempt to reduce contention by interleaving the order that producer
@@ -1105,21 +1102,23 @@ public:
 	// under contention, but will give more predictable results in single-threaded
 	// consumer scenarios. This is mostly only useful for internal unit tests.
 	// Never allocates. Thread-safe.
-	std::optional<T> try_dequeue_non_interleaved()
+	template<typename U>
+	bool try_dequeue_non_interleaved(U& item)
 	{
 		for (auto ptr = producerListTail.load(std::memory_order_acquire); ptr != nullptr; ptr = ptr->next_prod()) {
-			if (auto item = ptr->dequeue(item)) {
-				return item;
+			if (ptr->dequeue(item)) {
+				return true;
 			}
 		}
-		return std::nullopt;
+		return false;
 	}
 	
 	// Attempts to dequeue from the queue using an explicit consumer token.
-	// Returns std::nullopt if all producer streams appeared empty at the time they
+	// Returns false if all producer streams appeared empty at the time they
 	// were checked (so, the queue is likely but not guaranteed to be empty).
 	// Never allocates. Thread-safe.
-	std::optional<T> try_dequeue(consumer_token_t& token)
+	template<typename U>
+	bool try_dequeue(consumer_token_t& token, U& item)
 	{
 		// The idea is roughly as follows:
 		// Every 256 items from one producer, make everyone rotate (increase the global offset) -> this means the highest efficiency consumer dictates the rotation speed of everyone else, more or less
@@ -1129,17 +1128,17 @@ public:
 		
 		if (token.desiredProducer == nullptr || token.lastKnownGlobalOffset != globalExplicitConsumerOffset.load(std::memory_order_relaxed)) {
 			if (!update_current_producer_after_rotation(token)) {
-				return std::nullopt;
+				return false;
 			}
 		}
 		
 		// If there was at least one non-empty queue but it appears empty at the time
 		// we try to dequeue from it, we need to make sure every queue's been tried
-		if (auto item = static_cast<ProducerBase*>(token.currentProducer)->dequeue()) {
+		if (static_cast<ProducerBase*>(token.currentProducer)->dequeue(item)) {
 			if (++token.itemsConsumedFromCurrent == EXPLICIT_CONSUMER_CONSUMPTION_QUOTA_BEFORE_ROTATE) {
 				globalExplicitConsumerOffset.fetch_add(1, std::memory_order_relaxed);
 			}
-			return item;
+			return true;
 		}
 		
 		auto tail = producerListTail.load(std::memory_order_acquire);
@@ -1148,17 +1147,17 @@ public:
 			ptr = tail;
 		}
 		while (ptr != static_cast<ProducerBase*>(token.currentProducer)) {
-			if (auto item = ptr->dequeue()) {
+			if (ptr->dequeue(item)) {
 				token.currentProducer = ptr;
 				token.itemsConsumedFromCurrent = 1;
-				return item;
+				return true;
 			}
 			ptr = ptr->next_prod();
 			if (ptr == nullptr) {
 				ptr = tail;
 			}
 		}
-		return std::nullopt;
+		return false;
 	}
 	
 	// Attempts to dequeue several elements from the queue.
@@ -1232,12 +1231,13 @@ public:
 	// Attempts to dequeue from a specific producer's inner queue.
 	// If you happen to know which producer you want to dequeue from, this
 	// is significantly faster than using the general-case try_dequeue methods.
-	// Returns std::nullopt if the producer's queue appeared empty at the time it
+	// Returns false if the producer's queue appeared empty at the time it
 	// was checked (so, the queue is likely but not guaranteed to be empty).
 	// Never allocates. Thread-safe.
-	inline std::optional<T> try_dequeue_from_producer(producer_token_t const& producer)
+	template<typename U>
+	inline bool try_dequeue_from_producer(producer_token_t const& producer, U& item)
 	{
-		return static_cast<ExplicitProducer*>(producer.producer)->dequeue();
+		return static_cast<ExplicitProducer*>(producer.producer)->dequeue(item);
 	}
 	
 	// Attempts to dequeue several elements from a specific producer's inner queue.
@@ -1674,13 +1674,14 @@ private:
 		
 		virtual ~ProducerBase() { };
 		
-		inline std::optional<T> dequeue()
+		template<typename U>
+		inline bool dequeue(U& element)
 		{
 			if (isExplicit) {
-				return static_cast<ExplicitProducer*>(this)->dequeue();
+				return static_cast<ExplicitProducer*>(this)->dequeue(element);
 			}
 			else {
-				return static_cast<ImplicitProducer*>(this)->dequeue();
+				return static_cast<ImplicitProducer*>(this)->dequeue(element);
 			}
 		}
 		
@@ -1916,7 +1917,8 @@ private:
 			return true;
 		}
 		
-		std::optional<T> dequeue()
+		template<typename U>
+		bool dequeue(U& element)
 		{
 			auto tail = this->tailIndex.load(std::memory_order_relaxed);
 			auto overcommit = this->dequeueOvercommit.load(std::memory_order_relaxed);
@@ -1982,7 +1984,7 @@ private:
 					
 					// Dequeue
 					auto& el = *((*block)[index]);
-					if (!MOODYCAMEL_NOEXCEPT_ASSIGN(T, T&&, new (nullptr) T(std::move(el)))) {
+					if (!MOODYCAMEL_NOEXCEPT_ASSIGN(T, T&&, element = std::move(el))) {
 						// Make sure the element is still fully dequeued and destroyed even if the assignment
 						// throws
 						struct Guard {
@@ -1996,14 +1998,15 @@ private:
 							}
 						} guard = { block, index };
 						
-						return std::move(el);
+						element = std::move(el);
 					}
 					else {
-						auto element = std::move(el);
+						element = std::move(el);
 						el.~T();
 						block->ConcurrentQueue::Block::template set_empty<explicit_context>(index);
-						return element;
 					}
+					
+					return true;
 				}
 				else {
 					// Wasn't anything to dequeue after all; make the effective dequeue count eventually consistent
@@ -2011,7 +2014,7 @@ private:
 				}
 			}
 		
-			return std::nullopt;
+			return false;
 		}
 		
 		template<AllocationMode allocMode, typename It>
@@ -2502,7 +2505,8 @@ private:
 			return true;
 		}
 		
-		std::optional<T> dequeue()
+		template<typename U>
+		bool dequeue(U& element)
 		{
 			// See ExplicitProducer::dequeue for rationale and explanation
 			index_t tail = this->tailIndex.load(std::memory_order_relaxed);
@@ -2522,7 +2526,7 @@ private:
 					auto block = entry->value.load(std::memory_order_relaxed);
 					auto& el = *((*block)[index]);
 					
-					if (!MOODYCAMEL_NOEXCEPT_ASSIGN(T, T&&, new (nullptr) T(std::move(el)))) {
+					if (!MOODYCAMEL_NOEXCEPT_ASSIGN(T, T&&, element = std::move(el))) {
 #if MCDBGQ_NOLOCKFREE_IMPLICITPRODBLOCKINDEX
 						// Note: Acquiring the mutex with every dequeue instead of only when a block
 						// is released is very sub-optimal, but it is, after all, purely debug code.
@@ -2544,10 +2548,10 @@ private:
 							}
 						} guard = { block, index, entry, this->parent };
 						
-						return std::move(el);
+						element = std::move(el);
 					}
 					else {
-						auto element = std::move(el);
+						element = std::move(el);
 						el.~T();
 					
 						if (block->ConcurrentQueue::Block::template set_empty<implicit_context>(index)) {
@@ -2560,15 +2564,16 @@ private:
 							}
 							this->parent->add_block_to_free_list(block);		// releases the above store
 						}
-						return element;
 					}
+					
+					return true;
 				}
 				else {
 					this->dequeueOvercommit.fetch_add(1, std::memory_order_release);
 				}
 			}
 		
-			return std::nullopt;
+			return false;
 		}
 		
 		template<AllocationMode allocMode, typename It>
