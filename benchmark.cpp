@@ -272,16 +272,18 @@ T pop(boost::lockfree::queue<T>& q)
 template<typename T>
 T pop(moodycamel::ConcurrentQueue<T>& q)
 {
-    auto item = q.try_dequeue();
-    for (; !item; item = q.try_dequeue())
+    T item{};
+    while (!q.try_dequeue(item))
         std::this_thread::yield();
-    return std::move(*item);
+    return item;
 }
 
 template<typename T>
 T pop(moodycamel::BlockingConcurrentQueue<T>& q)
 {
-    return q.wait_dequeue();
+    T item{};
+    q.wait_dequeue(item);
+    return item;
 }
 
 template<typename T>
